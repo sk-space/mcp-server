@@ -15,8 +15,8 @@ class HuggingFaceClientWrapper:
 
     def __init__(self):
         self.client = OpenAI(
-            base_url=os.environ["HF_API_URL"],
-            api_key=os.environ["HF_TOKEN"],
+            base_url=os.getenv("HF_API_URL"),
+            api_key=os.getenv("HF_TOKEN"),
         )
         self._model_name = os.getenv("HF_MODEL_NAME")
 

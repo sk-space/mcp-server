@@ -36,7 +36,7 @@ class MCPConfig:
 
 
 @mcp.tool(title="NL2SQL Converter")
-async def convert_to_sql(query: str, schema_context: str) -> dict:
+async def tool_convert_to_sql(query: str, schema_context: str) -> dict:
     """
         Converts a natural language query into a valid SQL statement.
 

@@ -7,7 +7,7 @@ wheels/
 *.egg-info
 *.lock
 *.log
-.idea
+.idea/*
 
 # Virtual environments
 .venv
