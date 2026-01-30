@@ -1,9 +1,9 @@
 import os
 from dataclasses import dataclass
 
-# from mcp.server.fastmcp import FastMCP
 from fastmcp import FastMCP
-from agent import nl2sql_agent
+
+from agent_generator import nl2sql_agent
 from logger import setup_file_logging, get_logger
 
 setup_file_logging("server.log")
@@ -36,7 +36,7 @@ class MCPConfig:
 
 
 @mcp.tool(title="NL2SQL Converter")
-async def tool_convert_to_sql(query: str, schema_context: str) -> dict:
+async def tool_convert_to_sql(query: str, schema_context: dict) -> dict:
     """
         Converts a natural language query into a valid SQL statement.
 

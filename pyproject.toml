@@ -11,6 +11,7 @@ dependencies = [
     "langchain-huggingface>=1.2.0",
     "mcp>=1.26.0",
     "openai>=2.15.0",
+    "sqlglot>=26.33.0",
     "torch>=2.10.0",
     "transformers>=4.57.6",
 ]
