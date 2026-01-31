@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from fastmcp import FastMCP
 
-from agent_generator import nl2sql_agent
+from agent_generator import NL2SQLAgent
 from logger import setup_file_logging, get_logger
 
 setup_file_logging("server.log")
@@ -63,6 +63,7 @@ async def tool_convert_to_sql(query: str, schema_context: dict) -> dict:
     try:
         logger.info(f"Server: Converting query to SQL: {query}")
         logger.info(f"Server: Provided schema context: {schema_context}")
+        nl2sql_agent = NL2SQLAgent()
         sql = nl2sql_agent.generate_sql(query, schema_context)
         return {
             "success": True,

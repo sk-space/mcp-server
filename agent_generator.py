@@ -1,12 +1,15 @@
 import os
 import re
+from typing import Optional
 
 from dotenv import load_dotenv
 from langchain_core.output_parsers import BaseOutputParser
 from langchain_core.prompts import PromptTemplate
 
-from agent_validator import sql_validator
-from llm import hf_interface
+from agent_validator import SQLValidator
+import sqlglot
+import sqlglot.expressions as exp
+
 from logger import setup_file_logging, get_logger
 
 setup_file_logging("server.log")
@@ -51,7 +54,10 @@ class SQLOutputParser(BaseOutputParser):
 
 class NL2SQLAgent:
     def __init__(self):
-        self.MAX_ITERATIONS = 5
+        # Local import so that importing this module doesn't initialize/load models.
+        from llm import hf_interface
+
+        self.MAX_ITERATIONS = 10
         self.output_parser = SQLOutputParser()
         self.current_model = hf_interface.load_model()
         self.base_url = os.getenv("HF_API_URL")
@@ -140,13 +146,29 @@ class NL2SQLAgent:
 
         except Exception as e:
             logger.info(f"Error generating SQL with LLM: {e}")
-            # Fallback to rule-based generation
-            return self.generate_sql_rule_based(natural_language_query)
+            raise RuntimeError(
+                f"Failed to generate valid SQL. Error: {e}"
+            )
 
     def validate_fix_and_optimize_sql(self, sql, schema):
+        """
+        Validate, fix, and optimize SQL query using comprehensive validation.
+
+        The ComprehensiveSQLValidator returns a detailed response with:
+        - syntax: {valid, ast/error}
+        - structure: {valid, errors, warnings, metadata}
+        - semantic: {valid}
+        - types: {valid, errors, warnings, inferred_types}
+        - dialect: {compatible, score, issues, suggestions}
+        - performance: {performance_issues, score}
+        - summary: {overall_valid, issue_count, warning_count, ...}
+        """
+        sql_validator = SQLValidator()
+        sql_validator.load_schema(schema)
         history = []
+
         for attempt in range(self.MAX_ITERATIONS):
-            result = sql_validator.validate_mysql_sql(sql, schema)
+            result = sql_validator.validate_query(sql)
             logger.info(f"Result {attempt}: {result}")
 
             history.append({
@@ -158,28 +180,191 @@ class NL2SQLAgent:
             if result["valid"]:
                 break
 
-            # Feed structured errors to LLM
             sql = self.llm_fix_sql(
                 sql=sql,
                 errors=result["errors"],
                 schema=schema
             )
         else:
-            logger.info(f"History1: {history}")
+            logger.warning(f"Failed to generate valid SQL after {self.MAX_ITERATIONS} attempts")
+            logger.info(f"Validation history: {history}")
             raise RuntimeError(
-                "Failed to generate valid SQL after "
-                f"{self.MAX_ITERATIONS} attempts"
+                f"Failed to generate valid SQL after {self.MAX_ITERATIONS} attempts. "
             )
 
-        final_check = sql_validator.validate_mysql_sql(sql, schema)
+        # Optimization step (deterministic, no LLM):
+        # - normalize/format
+        # - enforce unique SELECT output aliases to satisfy downstream consumers and the validator
+        optimized_sql = self.optimize_sql(sql)
 
-        logger.info(f"History2: {history}")
+        # Final validation check on optimized output
+        final_result = sql_validator.validate_query(optimized_sql)
+        final_valid = final_result["valid"]
 
-        if not final_check["valid"]:
-            return final_check
+        logger.info(f"Final validation (after optimize): valid={final_valid}")
+        logger.info(f"Validation history: {history}")
 
-        return sql.replace("NULLS LAST", "")
+        if not final_valid:
+            return {
+                "valid": False,
+                "sql": optimized_sql,
+                "result": final_result
+            }
 
+        return optimized_sql.replace("NULLS LAST", "")
+
+    def optimize_sql(self, sql: str) -> str:
+        """Best-effort SQL optimization/normalization.
+
+        This is intentionally deterministic (no LLM):
+        - Parse with sqlglot (mysql dialect)
+        - Drop redundant duplicate JOIN-key projections (Option 2)
+          Example: SELECT a.id, b.id FROM a JOIN b ON a.id = b.id  -> keep one
+        - Ensure every SELECT projection has an explicit alias
+        - Ensure SELECT output aliases are unique
+        - Return a formatted SQL string
+        """
+        if not sql:
+            return sql
+
+        try:
+            tree = sqlglot.parse_one(sql, dialect="mysql")
+        except Exception:
+            return sql
+
+        for select in tree.find_all(exp.Select):
+            # Option 2: remove redundant join-key projections first
+            self._drop_duplicate_join_key_projections(select)
+            # Then enforce explicit, unique output aliases
+            self._enforce_unique_select_aliases(select)
+
+        try:
+            return tree.sql(dialect="mysql", pretty=False)
+        except Exception:
+            return sql
+
+    def _drop_duplicate_join_key_projections(self, select: exp.Select) -> None:
+        """Drop redundant projections when they are the *same join key*.
+
+        We detect simple equi-join predicates of the form:
+            <alias1>.<col> = <alias2>.<col>
+
+        If both sides' columns are selected in the same SELECT list *without explicit aliases*,
+        we keep the first occurrence and drop later duplicates.
+
+        This is conservative:
+        - Only handles equality joins between two columns.
+        - Only drops when the projection is a plain Column (not an Alias, not an expression).
+        """
+        joins = select.args.get("joins") or []
+        if not joins:
+            return
+
+        # Build a set of equivalent column pairs from join ON conditions.
+        # We store as frozenset({(alias, col), (alias, col)}) so order doesn't matter.
+        equiv_pairs: set[frozenset[tuple[str, str]]] = set()
+
+        def record_equivalence(left: exp.Expression, right: exp.Expression) -> None:
+            if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+                if left.table and right.table and left.name and right.name:
+                    equiv_pairs.add(frozenset({(left.table, left.name), (right.table, right.name)}))
+
+        # Extract join predicate equalities
+        for j in joins:
+            on_expr = j.args.get("on")
+            if not on_expr:
+                continue
+
+            # Find all equality expressions within ON (handles AND chains)
+            for eq in on_expr.find_all(exp.EQ):
+                record_equivalence(eq.this, eq.expression)
+
+        if not equiv_pairs:
+            return
+
+        projections = list(select.expressions or [])
+        if not projections:
+            return
+
+        # Track first seen join-key side we kept, keyed by normalized equivalence pair
+        kept_for_pair: dict[frozenset[tuple[str, str]], tuple[str, str]] = {}
+        new_projs: list[exp.Expression] = []
+
+        for proj in projections:
+            # Only drop plain columns (no explicit alias). If user aliased it, keep.
+            if isinstance(proj, exp.Alias):
+                new_projs.append(proj)
+                continue
+
+            if not isinstance(proj, exp.Column) or not proj.table or not proj.name:
+                new_projs.append(proj)
+                continue
+
+            this_side = (proj.table, proj.name)
+            matched_pair: Optional[frozenset[tuple[str, str]]] = None
+            for p in equiv_pairs:
+                if this_side in p:
+                    matched_pair = p
+                    break
+
+            if matched_pair is None:
+                new_projs.append(proj)
+                continue
+
+            if matched_pair not in kept_for_pair:
+                kept_for_pair[matched_pair] = this_side
+                new_projs.append(proj)
+                continue
+
+        select.set("expressions", new_projs)
+
+    def _enforce_unique_select_aliases(self, select: exp.Select) -> None:
+        """Mutates select.expressions so each projection has a unique explicit alias.
+
+        After dropping join-key duplicates we still want a stable output schema:
+        - Every projection becomes `expr AS alias` (unless it already is an Alias)
+        - Aliases are made unique by prefixing with table alias and/or numeric suffix
+        """
+        projections = list(select.expressions or [])
+        if not projections:
+            return
+
+        used: set[str] = set()
+        new_projs: list[exp.Expression] = []
+
+        for idx, proj in enumerate(projections, start=1):
+            expr = proj
+            alias: Optional[str] = None
+
+            if isinstance(proj, exp.Alias):
+                expr = proj.this
+                alias = proj.alias
+            else:
+                if isinstance(proj, exp.Column):
+                    alias = proj.name
+                else:
+                    alias = f"expr_{idx}"
+
+            base = alias or f"expr_{idx}"
+            candidate = base
+
+            if candidate in used:
+                if isinstance(expr, exp.Column) and expr.table:
+                    candidate = f"{expr.table}_{base}"
+                if candidate in used:
+                    n = 2
+                    while f"{candidate}_{n}" in used:
+                        n += 1
+                    candidate = f"{candidate}_{n}"
+
+            used.add(candidate)
+
+            if isinstance(proj, exp.Alias) and proj.alias == candidate:
+                new_projs.append(proj)
+            else:
+                new_projs.append(exp.alias_(expr, candidate, quoted=False))
+
+        select.set("expressions", new_projs)
 
     def llm_fix_sql(self, sql: str, errors: list, schema: dict) -> str:
         """
@@ -255,30 +440,3 @@ class NL2SQLAgent:
         logger.info(f"LLM fixed query: {sql_query}")
 
         return sql_query
-
-    def generate_sql_rule_based(self, natural_language_query):
-        """Simple rule-based SQL generation as fallback"""
-        query_lower = natural_language_query.lower()
-
-        rules = [
-            (["engineer", "engineering"], "SELECT * FROM employees WHERE department = 'Engineering'"),
-            (["hr", "human resources"], "SELECT * FROM employees WHERE department = 'HR'"),
-            (["market", "marketing"], "SELECT * FROM employees WHERE department = 'Marketing'"),
-            (["sales"], "SELECT * FROM employees WHERE department = 'Sales'"),
-            (["average", "avg", "salary"], "SELECT department, AVG(salary) as average_salary FROM employees GROUP BY department"),
-            (["high", "highest", "max", "salary"], "SELECT name, salary FROM employees ORDER BY salary DESC LIMIT 1"),
-            (["low", "lowest", "min", "salary"], "SELECT name, salary FROM employees ORDER BY salary ASC LIMIT 1"),
-            (["recent", "new", "hired", "hire date"], "SELECT name, hire_date FROM employees ORDER BY hire_date DESC"),
-            (["project", "projects"], "SELECT p.name as project_name, d.name as department_name FROM projects p JOIN departments d ON p.department_id = d.id"),
-            (["count", "how many", "employees"], "SELECT COUNT(*) as total_employees FROM employees"),
-            (["department", "departments", "list"], "SELECT name, budget FROM departments"),
-        ]
-
-        for keywords, sql in rules:
-            if any(keyword in query_lower for keyword in keywords):
-                return sql
-
-        return "SELECT * FROM employees LIMIT 10"
-
-
-nl2sql_agent = NL2SQLAgent()
