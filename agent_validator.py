@@ -30,7 +30,31 @@ class SQLValidator:
         self.table_aliases: Dict[str, Any] = {}
 
     def load_schema(self, schema: Dict) -> None:
-        self.schema = schema or {}
+        # Accept either:
+        # - {table: {"columns": {col: {...}}}}
+        # - {"tables": {table: {"columns": [col, ...]}}}  (MCP format)
+        # - {table: {"columns": [col, ...]}}
+        schema = schema or {}
+        if isinstance(schema.get("tables"), dict):
+            schema = schema.get("tables") or {}
+
+        normalized: Dict[str, Any] = {}
+        for table_name, tinfo in (schema or {}).items():
+            if not isinstance(tinfo, dict):
+                normalized[table_name] = {"columns": {}}
+                continue
+
+            cols = tinfo.get("columns")
+            if isinstance(cols, list):
+                normalized_cols = {c: {} for c in cols}
+            elif isinstance(cols, dict):
+                normalized_cols = cols
+            else:
+                normalized_cols = {}
+
+            normalized[table_name] = {**tinfo, "columns": normalized_cols}
+
+        self.schema = normalized
 
     def validate_query(self, query: str) -> Dict[str, Any]:
         self.errors = []
